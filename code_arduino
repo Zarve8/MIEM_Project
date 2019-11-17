@@ -1,0 +1,355 @@
+// в этой версии приёмник подключен, пины каналов приёмника окончательно зафиксированы
+
+#include <Wire.h>  // библиотека Arduino для коммуникации c компьютером
+#include <PID_v1.h> // библиотека PID регулятора
+#include <TroykaIMU.h> // библиотека Amperka IMU работы с сенсорами
+#include <Servo.h> // библиотека Arduino для работы с серво 
+
+// ================== Приёмник и Моторы ==========================
+// Пины Arduino Uno входных сигналов от приёмника
+//  CH1 PIN 2  //INT0, Roll , 1500+-500 мкс
+//  CH2 PIN 3  //INT1 , Pitch, 1500+-500 мкс
+//  CH3 PIN 8  //PCINT0, Thrust, 1000...2000 мкс
+//  CH4 PIN 4 //PCINT20, Yaw, 1500+-500 мкс
+//  CH5 PIN A0 //PCINT8, StabMode, 1000, 1500, 2000 мкс
+
+// объявление переменные для работы с сигналами моторов, попробуем вынести сюда из цикла loop
+  int rx1;
+  int rx2 ;
+  int rx3 ;
+  int rx4 ;
+
+// Пины моторов/серво
+#define M1_PIN 9
+#define M2_PIN 10
+#define M3_PIN 11
+#define M4_PIN 12
+
+// Переменные для обработки приёмника. Время обнаружения возрастающего фронта, мкс
+volatile int rxPrev[5]={0,0,0,0,0};
+// Номера элементов в массиве соответствуют пинам: {INT0, INT1, PCINT0,  PCINT20, PCINT8,}
+
+// Переменные для обработки приёмника. Текущее значение длины импульса, мкс
+volatile int rxVal[5]={0,0,0,0,0};
+// Номера элементов в массиве соответствуют пинам: {INT0, INT1, PCINT0, PCINT20, PCINT8}    
+
+// Создаём обьекты моторов
+Servo M1;
+Servo M2;
+Servo M3;
+Servo M4;
+
+// ================= Стабилизация =======================
+// Переменные для управляющих сигналов и стабилизации 
+double pdif, rdif, tdif, ydif; 
+double setpitch, setroll, setthrust, setyaw;
+double thrust;
+// получаемые углы ориентации из сенсоров в градусах
+double yaw, pitch, roll;
+
+// Коэффиценты расходов по каналам
+double pitch_k = 30;    // 30 - соответствует наклону квадракоптера в 30 град вперед/назад при полном отклонении ручки вперед/назад от центра
+double roll_k = 30;     // 30 - соответствует наклону квадракоптера в 30 град вправо/влево при полном отклонении ручки от центра вправо/влево
+double thrust_k = 100;  // 100 -  полному расходу ручки газа соответствует 0-90% оборотов двигателя
+double yaw_k = 3;      // 3 - полное отклонение ручки от центра в право/лево соотвествует 3 град/сек угловой скорости поворота квадракоптера вправо/лево 
+
+// Коэффициент чувствительности расхода мотора от управляющиего угла ориентации
+#define  pitch_p  1      //  при =1: 1 градус управления вызывает 1 процентам газа мотора
+#define  roll_p  1      // при =1:  1 градус управления соответствует 1 процентам газа мотора
+#define  yaw_p   1      // при =1: 1 градус управления соответствует 1 процентам газа мотора
+
+// Коэфициенты PID стабилизации (пока без возможности сохранения новых в памяти)
+double pitch_kp = 2;
+double roll_kp = 2;
+double thrust_kp = 2;
+double yaw_kp = 2;
+
+double pitch_ki = 5;
+double roll_ki = 5;
+double thrust_ki = 5;
+double yaw_ki = 5;
+
+double pitch_kd = 1;
+double roll_kd = 1;
+double thrust_kd = 1;
+double yaw_kd = 1;
+
+// создаём PID регуляторы. Синтаксис PID(&Input, &Output, &Setpoint, Kp, Ki, Kd, Direction)
+PID rollPID(&roll, &rdif, &setroll, roll_kp, roll_ki,roll_kd, DIRECT);
+PID pitchPID(&pitch, &pdif, &setpitch, pitch_kp, pitch_ki,pitch_kd, DIRECT);
+PID thrustPID(&thrust, &tdif, &setthrust, thrust_kp, thrust_ki,thrust_kd, DIRECT); 
+PID yawPID(&yaw, &ydif, &setyaw, yaw_kp, yaw_ki,yaw_kd, DIRECT);
+
+// ================= Сенсоры ===================================
+// множитель фильтра
+#define BETA 0.22f
+ 
+// создаём объект для фильтра Madgwick
+Madgwick filter;
+ 
+// создаём объект для работы с акселерометром
+Accelerometer accel(ACCEL_ADDRESS_V1);
+// создаём объект для работы с гироскопом
+Gyroscope gyro(GYRO_ADDRESS_V1);
+
+// переменные для данных с гироскопов, акселерометров
+float gx, gy, gz, ax, ay, az;
+ 
+// переменная для хранения частоты выборок фильтра
+float fps = 100;
+
+
+  // ============================ Инициализация ================================
+void setup() {
+  // открываем сразу последовательный порт 
+  Serial.begin(115200);
+  
+  // инициализируем коммуникацию с приёмником ( код обрабоки взят с http://arduino.ru/forum/programmirovanie/chtenie-neskolkikh-kanalov-pwm-ot-priemnika-rc , пост #11)
+  pinMode(2,INPUT_PULLUP); // Настройка пина с номером PCINT18/INT0 на приём с подтягивающим резистором
+  pinMode(3,INPUT_PULLUP); // Настройка пина с номером PCINT19/INT1 на приём с подтягивающим резистором
+  pinMode(4,INPUT_PULLUP); // Настройка пина с номером PCINT20 на приём с подтягивающим резистором
+  pinMode(8,INPUT_PULLUP); // Настройка пина с номером PCINT0 на приём с подтягивающим резистором
+  pinMode(A0,INPUT_PULLUP); // Настройка пина с номером PCINT8 на приём с подтягивающим резистором
+  // См. схему размещения пинов <a title="https://www.arduino.cc/en/Hacking/Atmega168Hardware" href="https://www.arduino.cc/en/Hacking/Atmega168Hardware" rel="nofollow">https://www.arduino.cc/en/Hacking/Atmega168Hardware</a>
+  
+  // Настраивает обработку прерываний на пинах INT1 и INT2 (INT0_vect и INT1_vect) на срабатывание при падении или возрастании фронта
+  EICRA|= (1<<ISC10) | (1<<ISC00); // тут была ошибка
+  
+  // Разрешает обработку прерываний на пинах INT1 и INT0
+  EIMSK|= (1<<INT1) | (1<<INT0);
+  
+  // Устанавливает прерывания на пинах:
+  // Диапазон пинов PCINT[23..16] (PCIE2)
+  // Диапазон пинов PCINT[14..8] (PCIE1)
+  // Диапазон пинов PCINT[7..0] (PCIE0)
+  PCICR|= (1<<PCIE2) |(1<<PCIE1) |(1<<PCIE0);
+  // После этого:
+  // ЛЮБОЕ изменение сигнала на любом из пинов PCINT23..16 будет вызывать физическое прерывание PCINT2_vect
+  // ЛЮБОЕ изменение сигнала на любом из пинов PCINT14..8 будет вызывать физическое прерывание PCINT1_vect
+  // ЛЮБОЕ изменение сигнала на любом из пинов PCINT7..0 будет вызывать физическое прерывание PCINT0_vect
+  
+  // Настраивает прерывание PCINT0_vect так, чтобы оно реагировало только на изменение сигнала на пине PCINT0
+  PCMSK0|= 1<<PCINT0;
+  
+  // Настраивает прерывание PCINT1_vect так, чтобы оно реагировало только на изменение сигнала на пине PCINT8
+  PCMSK1|= 1<<PCINT8;
+  
+  // Настраивает прерывание PCINT2_vect так, чтобы оно реагировало только на изменение сигнала на пине PCINT20
+  PCMSK2|= 1<<PCINT20;
+
+  // привязываем моторы
+  M1.attach(M1_PIN,1000,2000); 
+  M2.attach(M2_PIN,1000,2000); 
+  M3.attach(M3_PIN,1000,2000); 
+  M4.attach(M4_PIN,1000,2000); 
+
+  // ставим все моторы в ноль
+  M1.writeMicroseconds(1000);
+  M2.writeMicroseconds(1000); 
+  M3.writeMicroseconds(1000) ;
+  M4.writeMicroseconds(1000) ;
+  
+  // Инициализируем сенсоры
+  Serial.println("Begin init...");
+  // инициализация акселерометра
+  accel.begin();
+  // инициализация гироскопа
+  gyro.begin();
+  // выводим сообщение об удачной инициализации
+  Serial.println("Initialization completed");
+  
+  // конфигурируем код управления и стабилизации 
+   //  pdif = 0.0, rdif = 0.0, tdif=0.0, ydif=0.0;
+    // setpitch = 0.0, setroll = 0.0, setthrust = 0.0, setyaw=0.0;
+    // pitch = 0.0, roll = 0.0, yaw = 0.0;
+    
+    pitchPID.SetMode(AUTOMATIC), rollPID.SetMode(AUTOMATIC), thrustPID.SetMode(AUTOMATIC), yawPID.SetMode(AUTOMATIC);
+    
+    pitchPID.SetOutputLimits(-30, 30); rollPID.SetOutputLimits(-30, 30); yawPID.SetOutputLimits(-10, 10);
+  
+}
+
+void loop() {
+  //========================== Считываем приёмник ============================
+  // значения rxVal[] в микросекундах  1000...2000
+   rx1 = rxVal[0];
+   rx2 = rxVal[1];
+   rx3 = rxVal[2];
+   rx4 = rxVal[3];
+  
+    // выводим значения PWM сигналов от приёмника
+    Serial.print("RX1: ");
+    Serial.print(rx1);
+    Serial.print("  ");
+    Serial.print("RX2: ");
+    Serial.print(rx2);
+    Serial.print("  ");
+    Serial.print("RX3: ");
+    Serial.print(rx3);
+    Serial.print("  ");
+    Serial.print("RX4: ");
+    Serial.print(rx4);
+    Serial.print("  ");
+    
+  setroll = (float(rx1) - 1500)/500 * roll_k;  // в градусах
+  setpitch = -(float(rx2) - 1500)/500 * pitch_k; // в градусах
+  setthrust = (float(rx3)-1000)/1000 * thrust_k*0.9; // в процентах от полных оборотов двигателей, max 90% чтобы было пространство для стабилизации
+  setyaw = (float(rx4)-1500)/500 * yaw_k; // в градусах
+    
+  // выводим полученные целевые углы и газ  в serial-порт
+    Serial.print("sroll: ");
+    Serial.print(setroll);
+    Serial.print("  ");
+    Serial.print("spitch: ");
+    Serial.print(setpitch);
+    Serial.print("  ");
+    Serial.print("sthrust: ");
+    Serial.print(setthrust);
+    Serial.print("  ");
+    Serial.print("syaw: ");
+    Serial.print(setyaw);
+    Serial.print("  ");
+
+  //=================== Считываем сенсоры =============================
+  // запоминаем текущее время
+  unsigned long startMillis = millis();
+ 
+  // считываем данные с акселерометра в единицах G
+  accel.readGXYZ(&ax, &ay, &az);
+  // считываем данные с акселерометра в радианах в секунду
+  gyro.readRadPerSecXYZ(&gx, &gy, &gz);
+  // устанавливаем коэффициенты фильтра
+  filter.setKoeff(fps, BETA);
+  // обновляем входные данные в фильтр
+  filter.update(gx, gy, gz, ax, ay, az);
+ 
+  // получение углов yaw, pitch и roll из фильтра. Данные углов в градусах
+  yaw =  filter.getYawDeg();
+  pitch = - filter.getPitchDeg(); // знак меняем из-за того что так установлен сенсор
+  roll = - filter.getRollDeg();  // знак меняем из-за того что так установлен сенсор
+
+  // без стабилизации по высоте считаем, что замерянная тяга двигателей равна требуемой. 
+  thrust = setthrust; 
+ 
+  // выводим полученные углы Эйлера и тягу в serial-порт
+  Serial.print("roll: ");
+  Serial.print(roll);
+  Serial.print("  ");
+  Serial.print("pitch: ");
+  Serial.print(pitch);
+  Serial.print("  ");
+  Serial.print("thrust: ");
+  Serial.print(thrust);
+  Serial.print("  ");  
+  Serial.print("yaw: ");
+  Serial.print(yaw);
+  Serial.print("  ");
+ 
+  // вычисляем затраченное время на обработку данных
+  unsigned long deltaMillis = millis() - startMillis;
+  // вычисляем частоту обработки фильтра
+      fps = 1000 / deltaMillis;
+
+//==================== Алгоритм управление =============
+    // вычисляем управляющие сигналы в PID регуляторе
+    pitchPID.Compute(), rollPID.Compute(), thrustPID.Compute(), yawPID.Compute();
+    
+    // выводим значения управляющих сигналов
+          Serial.print("rdif: ");
+          Serial.print(rdif);
+          Serial.print("  ");     
+          Serial.print("pdif: ");
+          Serial.print(pdif);
+          Serial.print("  ");
+          Serial.print("tdif: ");
+          Serial.print(tdif);
+          Serial.print("  ");
+          Serial.print("ydif: ");
+          Serial.print(ydif);
+          Serial.print("  ");
+   
+  double p1 = setthrust + tdif + (rdif * roll_p / 2) + (pdif * pitch_p / 2) - (ydif * yaw_p / 2);
+  double p2 = setthrust + tdif - (rdif * roll_p / 2) + (pdif * pitch_p / 2) + (ydif * yaw_p / 2);
+  double p3 = setthrust + tdif - (rdif * roll_p / 2) - (pdif * pitch_p / 2) - (ydif * yaw_p / 2);
+  double p4 = setthrust + tdif + (rdif * roll_p / 2) - (pdif * pitch_p / 2) + (ydif * yaw_p / 2);
+ 
+// выводим управляющие значения газа моторов
+/*
+          Serial.print("p1: ");
+          Serial.print(p1);
+          Serial.print("  ");
+          Serial.print("p2: ");
+          Serial.print(p2);
+          Serial.print("  ");
+          Serial.print("p3: ");
+          Serial.print(p3);
+          Serial.print("  ");
+          Serial.print("p4: ");
+          Serial.print(p4);
+     */
+ // конец строки вывода телеметрии
+          Serial.println();           
+ 
+//======================= Моторы =====================
+// устанавливаем значения на моторах
+    M1.writeMicroseconds(1000 + (p1/100)*(2000-1000));
+    M2.writeMicroseconds(1000 + (p2/100)*(2000-1000));
+    M3.writeMicroseconds(1000 + (p3/100)*(2000-1000));
+    M4.writeMicroseconds(1000 + (p4/100)*(2000-1000));
+}
+
+// =================== Подпрограммы ==============================
+
+// Обработчик прерывания на пине INT0
+ISR (INT0_vect) {
+  if(digitalRead(2)==HIGH) {
+    // Обнаружен возрастающий фронт на INT0, запоминаем значение таймера
+    rxPrev[0] = micros();
+  } else {
+    // Обнаружен падающий фронт на INT0, вычисляем значение шим
+    rxVal[0] = micros() - rxPrev[0];
+  } 
+}
+// Обработчик прерывания на пине INT1
+ISR (INT1_vect) { 
+  if(digitalRead(3)==HIGH) {
+    // Обнаружен возрастающий фронт на INT1, запоминаем значение таймера
+    rxPrev[1] = micros();
+  } else {
+    // Обнаружен падающий фронт на INT1, вычисляем значение шим
+    rxVal[1] = micros() - rxPrev[1];
+  } 
+}
+// Обработчик прерывания на пине PCINT0
+ISR (PCINT0_vect) { 
+  if(digitalRead(8)==HIGH) {
+    // Обнаружен возрастающий фронт на PCINT0, запоминаем значение таймера
+    rxPrev[2] = micros();
+  } else {
+    // Обнаружен падающий фронт на PCINT0, вычисляем значение шим
+    rxVal[2] = micros() - rxPrev[2];
+  } 
+}
+// Обработчик прерывания на пине PCINT8
+ISR (PCINT1_vect) { 
+  if(digitalRead(A0)==HIGH) {
+    // Обнаружен возрастающий фронт на PCINT8, запоминаем значение таймера
+    rxPrev[4] = micros();
+  } else {
+    // Обнаружен падающий фронт на PCINT8, вычисляем значение шим
+    rxVal[4] = micros() - rxPrev[4];
+  } 
+}
+// Обработчик прерывания на пине PCINT20
+ISR (PCINT2_vect) { 
+  if(digitalRead(4)==HIGH) {
+    // Обнаружен возрастающий фронт на PCINT20, запоминаем значение таймера
+    rxPrev[3] = micros();
+  } else {
+    // Обнаружен падающий фронт на PCINT20, вычисляем значение шим
+    rxVal[3] = micros() - rxPrev[3];
+  } 
+}
+
+// Полная документация на ATMega 328, где описаны все регистры и константы:
+// <a href="http://www.atmel.com/ru/ru/Images/Atmel-42735-8-bit-AVR-Microcontroller-ATmega328-328P_Datasheet.pdf" rel="nofollow">http://www.atmel.com/ru/ru/Images/Atmel-42735-8-bit-AVR-Microcontroller-ATmega328-328P_Datasheet.pdf</a>
